@@ -28,11 +28,8 @@ class FakeZwaveClient {
 
 const baseConfig = {
   host: '192.168.1.50',
-  port: 8091,
+  port: 3000,
   ssl: false,
-  auth_required: false,
-  username: '',
-  password: '',
 };
 
 test('testConnection reports the node count and always disconnects', async () => {

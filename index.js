@@ -1,10 +1,11 @@
 // -----------------------------------------------------------------------------
 // Entry point of the Gladys external integration.
 //
-// Connects to zwave-js-ui's native Socket.IO API (port 8091 by default) and
-// mirrors its live node/value snapshot into Gladys devices/features. All the
-// Z-Wave protocol logic lives in src/zwaveClient.js and src/devices/; this
-// file only wires the SDK lifecycle to that snapshot.
+// Connects to zwave-js-server (port 3000 by default), the documented
+// WebSocket gateway zwave-js-ui optionally exposes, and mirrors its live
+// node/value snapshot into Gladys devices/features. All the Z-Wave protocol
+// logic lives in src/zwaveClient.js and src/devices/; this file only wires
+// the SDK lifecycle to that snapshot.
 //
 // Environment variables provided by the Gladys supervisor to the container:
 //   - GLADYS_HOST_API_URL         (host API URL)
@@ -27,7 +28,7 @@ let config = normalizeConfig();
 // Rebuilt on every discovery pass; resolves feature <-> node/value lookups.
 const registry = createNodeRegistry(gladys);
 
-// The live socket connection to zwave-js-ui. Null while disconnected/unconfigured.
+// The live socket connection to zwave-js-server. Null while disconnected/unconfigured.
 let zwaveClient = null;
 
 async function publishDiscovery() {
@@ -125,17 +126,17 @@ function wireZwaveClient(client) {
   });
 
   client.on(ZWAVE_CLIENT_EVENTS.DISCONNECTED, () => {
-    logger.warn('Disconnected from zwave-js-ui');
+    logger.warn('Disconnected from zwave-js-server');
     gladys
       .setConnectionStatus(false, {
-        en: 'Disconnected from zwave-js-ui.',
-        fr: 'Déconnecté de zwave-js-ui.',
+        en: 'Disconnected from zwave-js-server.',
+        fr: 'Déconnecté de zwave-js-server.',
       })
       .catch(() => {});
   });
 
   client.on(ZWAVE_CLIENT_EVENTS.ERROR, (err) => {
-    logger.error('zwave-js-ui client error', err);
+    logger.error('zwave-js-server client error', err);
   });
 }
 
@@ -150,11 +151,11 @@ async function connectZwave() {
   disconnectZwave();
 
   if (!isConfigComplete(config)) {
-    logger.warn('Configuration incomplete, waiting for host/credentials.');
+    logger.warn('Configuration incomplete, waiting for host/port.');
     await gladys
       .setConnectionStatus(false, {
-        en: 'Configure the zwave-js-ui host first.',
-        fr: "Configurez d'abord l'hôte zwave-js-ui.",
+        en: 'Configure the zwave-js-server host first.',
+        fr: "Configurez d'abord l'hôte zwave-js-server.",
       })
       .catch(() => {});
     return;
@@ -164,20 +165,17 @@ async function connectZwave() {
     host: config.host,
     port: config.port,
     ssl: config.ssl,
-    useAuth: config.auth_required,
-    username: config.username,
-    password: config.password,
   });
   wireZwaveClient(zwaveClient);
 
   try {
     await zwaveClient.connect();
   } catch (err) {
-    logger.error('Connection to zwave-js-ui failed', err);
+    logger.error('Connection to zwave-js-server failed', err);
     await gladys
       .setConnectionStatus(false, {
-        en: 'Could not connect to zwave-js-ui, check host/credentials.',
-        fr: "Connexion à zwave-js-ui impossible, vérifiez l'hôte et les identifiants.",
+        en: 'Could not connect to zwave-js-server, check host/port.',
+        fr: "Connexion à zwave-js-server impossible, vérifiez l'hôte et le port.",
       })
       .catch(() => {});
   }
@@ -193,7 +191,7 @@ gladys.onScanRequest(async () => {
 gladys.onSetValue(async (device, feature, value) => {
   logger.info(`onSetValue <- ${feature.external_id} = ${value}`);
   if (!zwaveClient) {
-    throw new Error('Not connected to zwave-js-ui');
+    throw new Error('Not connected to zwave-js-server');
   }
   const resolved = registry.resolveFeature(feature.external_id);
   if (!resolved || resolved.mapping.read_only || !resolved.mapping.writeValueId) {
@@ -208,7 +206,7 @@ gladys.onSetValue(async (device, feature, value) => {
 
 // --- Polling: Gladys asks to refresh a device --------------------------------
 // Z-Wave here is push-driven over the socket; this only re-publishes the
-// current cached snapshot for that device, it never queries zwave-js-ui.
+// current cached snapshot for that device, it never queries zwave-js-server.
 gladys.onPoll(async (device) => {
   if (!zwaveClient) {
     return;
@@ -236,7 +234,7 @@ gladys.onAction('test_connection', () => testConnection(config));
 gladys.onAction('identify', (fields) => {
   logger.info(`Action identify <- ${fields.device}`);
   if (!zwaveClient) {
-    return { en: 'Not connected to zwave-js-ui.', fr: 'Non connecté à zwave-js-ui.' };
+    return { en: 'Not connected to zwave-js-server.', fr: 'Non connecté à zwave-js-server.' };
   }
   return identifyDevice(zwaveClient, fields.device);
 });
@@ -245,7 +243,7 @@ gladys.onAction('identify', (fields) => {
 gladys.onConfigUpdated(async (newConfig) => {
   logger.info('onConfigUpdated -> new configuration received');
   config = normalizeConfig(newConfig);
-  // Host/port/credentials may have changed: reconnect from scratch.
+  // Host/port may have changed: reconnect from scratch.
   await connectZwave();
 });
 
@@ -276,7 +274,7 @@ gladys.handleShutdown((signal) => {
 });
 
 // --- Startup -----------------------------------------------------------------
-logger.info('Starting the Z-Wave (zwave-js-ui) integration...');
+logger.info('Starting the Z-Wave (zwave-js-server) integration...');
 gladys.connect().catch((err) => {
   logger.error('Initial connection failed', err);
   process.exit(1);

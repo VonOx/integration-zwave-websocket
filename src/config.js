@@ -14,11 +14,8 @@
 // `config_schema` of the manifest.
 export const DEFAULT_CONFIG = {
   host: '',
-  port: 8091,
+  port: 3000,
   ssl: false,
-  auth_required: false,
-  username: '',
-  password: '',
 };
 
 /**
@@ -32,23 +29,14 @@ export function normalizeConfig(raw = {}) {
     host: String(raw.host ?? DEFAULT_CONFIG.host).trim(),
     port: Number(raw.port ?? DEFAULT_CONFIG.port),
     ssl: raw.ssl === true || raw.ssl === 'true',
-    auth_required: raw.auth_required === true || raw.auth_required === 'true',
-    username: String(raw.username ?? DEFAULT_CONFIG.username),
-    password: String(raw.password ?? DEFAULT_CONFIG.password),
   };
 }
 
 /**
  * True once there is enough information to attempt a connection: a host/port
- * are set, and credentials are present whenever authentication is required.
+ * are set.
  * @param {ReturnType<typeof normalizeConfig>} config
  */
 export function isConfigComplete(config) {
-  if (!config.host || !config.port) {
-    return false;
-  }
-  if (config.auth_required && (!config.username || !config.password)) {
-    return false;
-  }
-  return true;
+  return Boolean(config.host && config.port);
 }

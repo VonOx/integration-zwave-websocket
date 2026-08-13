@@ -2,7 +2,7 @@
   "name": "integration-zwave-websocket",
   "version": "2.1.0",
   "private": true,
-  "description": "Gladys Assistant external integration for Z-Wave devices via zwave-js-ui, connected over its native Socket.IO API.",
+  "description": "Gladys Assistant external integration for Z-Wave devices via zwave-js-server, the WebSocket gateway exposed by zwave-js-ui.",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -16,8 +16,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@gladysassistant/integration-sdk": "^0.11.0",
-    "socket.io-client": "^4.8.0"
+    "@gladysassistant/integration-sdk": "^0.11.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

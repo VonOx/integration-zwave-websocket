@@ -1,16 +1,15 @@
 // -----------------------------------------------------------------------------
-// Thin wrapper around zwave-js-ui's NATIVE Socket.IO API (the one its own Vue
-// dashboard uses, default port 8091) — not the separate zwave-js-server
-// JSON-RPC gateway (port 3000).
+// Thin wrapper around zwave-js-server's WebSocket protocol (the documented
+// gateway also used natively by Home Assistant/ioBroker/Node-RED) — NOT
+// zwave-js-ui's own internal Socket.IO dashboard API.
 //
-// Nothing else in this codebase touches socket.io-client directly: callers
-// only see plain events (`ready`, `value-updated`, `node-updated`,
-// `node-added`, `node-removed`, `disconnected`, `error`) and a `nodes` Map
-// snapshot, so the rest of the integration stays testable without a socket.
+// Nothing else in this codebase touches the WebSocket directly: callers only
+// see plain events (`ready`, `value-updated`, `node-updated`, `node-added`,
+// `node-removed`, `disconnected`, `error`) and a `nodes` Map snapshot, so the
+// rest of the integration stays testable without a socket.
 // -----------------------------------------------------------------------------
 
 import { EventEmitter } from 'node:events';
-import { io as ioClient } from 'socket.io-client';
 import { createLogger } from '@gladysassistant/integration-sdk';
 
 const logger = createLogger({ name: 'zwave-client' });
@@ -27,107 +26,143 @@ export const ZWAVE_CLIENT_EVENTS = {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
+// We don't rely on any schema-version-specific field, so always request the
+// highest version the server offers (clamped to its own min/max) rather than
+// pinning a number we'd need to keep in sync with zwave-js-server releases.
+const PREFERRED_SCHEMA_VERSION = 100;
+
+const NODE_STATUS_LABELS = ['unknown', 'asleep', 'awake', 'dead', 'alive'];
+
+const NODE_STATUS_EVENT_MAP = {
+  dead: 'dead',
+  alive: 'alive',
+  'wake up': 'awake',
+  sleep: 'asleep',
+};
+
+const VALUE_UPDATE_EVENT_NAMES = new Set(['value updated', 'value added', 'value notification']);
+
+function normalizeNodeStatus(status) {
+  return NODE_STATUS_LABELS[status] ?? 'unknown';
+}
+
+/** zwave-js-server uses `nodeId`/numeric `status`; the rest of this codebase expects `id`/string `status`. */
+function normalizeNode(rawNode) {
+  return {
+    ...rawNode,
+    id: rawNode.nodeId,
+    status: normalizeNodeStatus(rawNode.status),
+  };
+}
+
+function normalizeEventValue(event) {
+  const { newValue, value, ...valueId } = event.args ?? {};
+  return {
+    nodeId: event.nodeId,
+    ...valueId,
+    value: newValue !== undefined ? newValue : value,
+  };
+}
+
 export class ZwaveClient extends EventEmitter {
   constructor({
     host,
     port,
     ssl = false,
-    useAuth = false,
-    username = '',
-    password = '',
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
-    ioFactory = ioClient,
+    wsFactory = (url) => new WebSocket(url),
   }) {
     super();
     this.host = host;
     this.port = port;
     this.ssl = ssl;
-    this.useAuth = useAuth;
-    this.username = username;
-    this.password = password;
     this.requestTimeoutMs = requestTimeoutMs;
-    this.ioFactory = ioFactory;
+    this.wsFactory = wsFactory;
 
-    // Live snapshot of the network, keyed by Z-Wave node id. Rebuilt from the
-    // `INITED` ack and kept current by VALUE_UPDATED/NODE_UPDATED/NODE_REMOVED.
+    // Live snapshot of the network, keyed by Z-Wave node id. Rebuilt from
+    // `start_listening` and kept current by node/controller push events.
     this.nodes = new Map();
 
     this.socket = null;
-    this._token = null; // in-memory only: never written to disk (read-only rootfs)
+    this._pending = new Map(); // messageId -> { resolve, reject }
+    this._messageIdCounter = 0;
+    this._destroyed = false;
 
     // Node throws (crashing the process) if an 'error' event has zero
     // listeners at emit time. This class uses 'error' as an application-level
-    // event (see _onConnect/_attachListeners), so guarantee at least one
-    // listener always exists regardless of what the consumer wires up;
-    // logging already happens before every emit, so this stays a safety net.
+    // event, so guarantee at least one listener always exists regardless of
+    // what the consumer wires up; logging already happens before every emit,
+    // so this stays a safety net.
     this.on(ZWAVE_CLIENT_EVENTS.ERROR, () => {});
   }
 
-  get baseUrl() {
-    return `${this.ssl ? 'https' : 'http'}://${this.host}:${this.port}`;
+  get wsUrl() {
+    return `${this.ssl ? 'wss' : 'ws'}://${this.host}:${this.port}`;
   }
 
   /**
-   * Connect, authenticate if needed, and complete the INITED/SUBSCRIBE
-   * handshake. Resolves once the initial network snapshot is available
-   * (the `ready` event), rejects if the connection or handshake fails.
+   * Connect and complete the initialize/start_listening handshake. Resolves
+   * once the initial network snapshot is available (the `ready` event),
+   * rejects if the connection or handshake fails or times out.
    */
   async connect() {
-    if (this.useAuth) {
-      await this._authenticate();
-    }
+    this._destroyed = false;
+    this.nodes.clear();
+    this._pending = new Map();
+    this._messageIdCounter = 0;
 
     return new Promise((resolve, reject) => {
-      const socket = this.ioFactory(this.baseUrl, {
-        transports: ['websocket'],
-        reconnection: true,
-        // A function lets a refreshed token be picked up on every reconnect
-        // attempt, since socket.io-client does not replay this handshake.
-        auth: (cb) => cb(this.useAuth ? { token: this._token } : {}),
-      });
+      const socket = this.wsFactory(this.wsUrl);
       this.socket = socket;
 
       let settled = false;
-      const onReady = () => {
+      // zwave-js-server has no per-connection handshake acknowledgement of
+      // its own beyond the initialize/start_listening replies (each already
+      // guarded by _sendCommand's own timeout) — this outer timeout only
+      // catches total silence (e.g. the server never even sends `version`),
+      // so connect() can never hang forever regardless of what happens.
+      const overallTimeout = setTimeout(() => {
+        settleReject(new Error('operation has timed out'));
+      }, this.requestTimeoutMs);
+
+      const settleResolve = () => {
         if (settled) return;
         settled = true;
-        socket.off('connect_error', onConnectError);
+        clearTimeout(overallTimeout);
         this.off(ZWAVE_CLIENT_EVENTS.ERROR, onError);
         resolve();
       };
-      const onConnectError = (err) => {
+      const settleReject = (err) => {
         if (settled) return;
         settled = true;
-        this.off(ZWAVE_CLIENT_EVENTS.READY, onReady);
-        this.off(ZWAVE_CLIENT_EVENTS.ERROR, onError);
+        clearTimeout(overallTimeout);
+        this.off(ZWAVE_CLIENT_EVENTS.READY, settleResolve);
         reject(err instanceof Error ? err : new Error(String(err)));
       };
-      // A handshake (INITED/SUBSCRIBE) failure only ever surfaces as an
-      // 'error' emit, never 'connect_error' (the transport did connect fine).
-      // Without this, connect() never settles on that failure and the caller
-      // awaits it forever.
-      const onError = (err) => {
-        if (settled) return;
-        settled = true;
-        this.off(ZWAVE_CLIENT_EVENTS.READY, onReady);
-        socket.off('connect_error', onConnectError);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      };
+      const onError = (err) => settleReject(err);
 
-      this.once(ZWAVE_CLIENT_EVENTS.READY, onReady);
-      socket.once('connect_error', onConnectError);
+      this.once(ZWAVE_CLIENT_EVENTS.READY, settleResolve);
       this.once(ZWAVE_CLIENT_EVENTS.ERROR, onError);
 
-      this._attachListeners(socket);
+      socket.addEventListener('error', (event) => {
+        this.emit(ZWAVE_CLIENT_EVENTS.ERROR, event?.error ?? new Error('WebSocket error'));
+      });
+      socket.addEventListener('close', (event) => this._handleClose(event));
+      socket.addEventListener('message', (event) => this._onMessage(event));
     });
   }
 
   disconnect() {
+    this._destroyed = true;
     if (this.socket) {
-      this.socket.removeAllListeners();
-      this.socket.disconnect();
+      try {
+        this.socket.close();
+      } catch {
+        // socket may already be closing/closed
+      }
       this.socket = null;
     }
+    this._rejectAllPending(new Error('Disconnected'));
     this.nodes.clear();
   }
 
@@ -140,100 +175,152 @@ export class ZwaveClient extends EventEmitter {
    * Write a Z-Wave value. `valueId = { nodeId, commandClass, endpoint, property, propertyKey }`.
    */
   async writeValue(valueId, value) {
-    return this._callApi('writeValue', [valueId, value]);
+    const { nodeId, commandClass, endpoint, property, propertyKey } = valueId;
+    const trimmedValueId = { commandClass, endpoint: endpoint ?? 0, property };
+    if (propertyKey !== undefined) {
+      trimmedValueId.propertyKey = propertyKey;
+    }
+
+    const result = await this._sendCommand('node.set_value', {
+      nodeId,
+      valueId: trimmedValueId,
+      value,
+    });
+    if (result && result.success === false) {
+      throw new Error(result.message || 'zwave-js-server rejected the write');
+    }
+    return result;
   }
 
-  async _callApi(api, args) {
-    if (!this.socket) {
-      throw new Error('Not connected to zwave-js-ui');
-    }
-    const ack = await this.socket
-      .timeout(this.requestTimeoutMs)
-      .emitWithAck('ZWAVE_API', { api, args });
-    if (!ack?.success) {
-      throw new Error(ack?.message ?? `zwave-js-ui API call "${api}" failed`);
-    }
-    return ack.result;
-  }
-
-  async _authenticate() {
-    try {
-      const res = await fetch(`${this.baseUrl}/api/auth-enabled`, {
-        signal: AbortSignal.timeout(this.requestTimeoutMs),
+  _sendCommand(command, params = {}) {
+    return new Promise((resolve, reject) => {
+      if (!this.socket) {
+        reject(new Error('Not connected to zwave-js-server'));
+        return;
+      }
+      const messageId = String(++this._messageIdCounter);
+      const timer = setTimeout(() => {
+        this._pending.delete(messageId);
+        reject(new Error(`operation has timed out (${command})`));
+      }, this.requestTimeoutMs);
+      this._pending.set(messageId, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
       });
-      if (res.ok) {
-        const body = await res.json();
-        if (body?.enabled === false) {
-          logger.warn('zwave-js-ui reports authentication disabled, but auth_required is set');
-        }
-      }
-    } catch (err) {
-      logger.debug('auth-enabled check failed (continuing anyway)', err);
-    }
-
-    const res = await fetch(`${this.baseUrl}/api/authenticate`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: this.username, password: this.password }),
-      signal: AbortSignal.timeout(this.requestTimeoutMs),
+      this.socket.send(JSON.stringify({ messageId, command, ...params }));
     });
-    if (!res.ok) {
-      throw new Error(`zwave-js-ui authentication failed: HTTP ${res.status}`);
-    }
-    const body = await res.json();
-    const token = body?.token ?? body?.data?.token;
-    if (!token) {
-      throw new Error('zwave-js-ui authentication response did not contain a token');
-    }
-    this._token = token;
   }
 
-  _attachListeners(socket) {
-    // socket.io-client's built-in reconnection does NOT replay INITED/SUBSCRIBE:
-    // 'connect' fires on first connect AND every reconnect, so redo it every time.
-    socket.on('connect', () => this._onConnect(socket));
-    socket.on('disconnect', (reason) => {
-      this.emit(ZWAVE_CLIENT_EVENTS.DISCONNECTED, reason);
-    });
-    socket.on('connect_error', async (err) => {
-      logger.error('Connection error', err);
-      if (this.useAuth) {
-        try {
-          await this._authenticate();
-        } catch (authErr) {
-          logger.error('Re-authentication failed', authErr);
-        }
-      }
-      this.emit(ZWAVE_CLIENT_EVENTS.ERROR, err);
-    });
-
-    socket.on('VALUE_UPDATED', (value) => this._handleValueUpdated(value));
-    socket.on('NODE_UPDATED', (node) =>
-      this._handleNodeUpdated(node, ZWAVE_CLIENT_EVENTS.NODE_UPDATED),
-    );
-    socket.on('NODE_ADDED', (node) =>
-      this._handleNodeUpdated(node, ZWAVE_CLIENT_EVENTS.NODE_ADDED),
-    );
-    socket.on('NODE_REMOVED', (node) => this._handleNodeRemoved(node));
+  _rejectAllPending(err) {
+    for (const pending of this._pending.values()) {
+      pending.reject(err);
+    }
+    this._pending.clear();
   }
 
-  async _onConnect(socket) {
+  _onMessage(event) {
+    if (this._destroyed) return;
+    let payload;
     try {
-      const snapshot = await socket.timeout(this.requestTimeoutMs).emitWithAck('INITED');
-      this._applySnapshot(snapshot);
-      await socket.timeout(this.requestTimeoutMs).emitWithAck('SUBSCRIBE', { target: 'ZWAVE' });
+      const raw = typeof event.data === 'string' ? event.data : event.data?.toString();
+      payload = JSON.parse(raw);
+    } catch (err) {
+      logger.error('Failed to parse zwave-js-server message', err);
+      return;
+    }
+
+    switch (payload.type) {
+      case 'version':
+        this._handleVersion(payload);
+        break;
+      case 'result':
+        this._handleResult(payload);
+        break;
+      case 'event':
+        this._handleEvent(payload.event);
+        break;
+      default:
+        break;
+    }
+  }
+
+  _handleClose(event) {
+    if (this._destroyed) return;
+    this.emit(ZWAVE_CLIENT_EVENTS.DISCONNECTED, event?.reason || 'closed');
+    this._rejectAllPending(new Error('WebSocket closed'));
+  }
+
+  async _handleVersion(payload) {
+    try {
+      const schemaVersion = Math.max(
+        payload.minSchemaVersion ?? 0,
+        Math.min(PREFERRED_SCHEMA_VERSION, payload.maxSchemaVersion ?? PREFERRED_SCHEMA_VERSION),
+      );
+      await this._sendCommand('initialize', { schemaVersion });
+      const { state } = await this._sendCommand('start_listening');
+      this._applySnapshot(state);
       this.emit(ZWAVE_CLIENT_EVENTS.READY);
     } catch (err) {
-      logger.error('Handshake (INITED/SUBSCRIBE) failed', err);
+      logger.error('zwave-js-server handshake failed', err);
       this.emit(ZWAVE_CLIENT_EVENTS.ERROR, err);
     }
   }
 
-  _applySnapshot(snapshot) {
+  _handleResult(payload) {
+    const pending = this._pending.get(payload.messageId);
+    if (!pending) {
+      return;
+    }
+    this._pending.delete(payload.messageId);
+    if (payload.success) {
+      pending.resolve(payload.result);
+    } else {
+      pending.reject(
+        new Error(
+          payload.zwaveErrorMessage ||
+            payload.message ||
+            `zwave-js-server command failed (${payload.errorCode})`,
+        ),
+      );
+    }
+  }
+
+  _applySnapshot(state) {
     this.nodes.clear();
-    const nodes = snapshot?.nodes ?? snapshot?.state?.nodes ?? [];
-    for (const node of nodes) {
+    const nodes = state?.nodes ?? [];
+    for (const rawNode of nodes) {
+      const node = normalizeNode(rawNode);
       this.nodes.set(node.id, node);
+    }
+  }
+
+  _handleEvent(event) {
+    if (!event) return;
+    if (event.source === 'node') {
+      this._handleNodeEvent(event);
+    } else if (event.source === 'controller') {
+      this._handleControllerEvent(event);
+    }
+  }
+
+  _handleNodeEvent(event) {
+    const name = event.event;
+    if (VALUE_UPDATE_EVENT_NAMES.has(name)) {
+      this._handleValueUpdated(normalizeEventValue(event));
+      return;
+    }
+    if (name === 'value removed') {
+      this._handleValueRemoved(event);
+      return;
+    }
+    if (name in NODE_STATUS_EVENT_MAP || name === 'ready') {
+      this._handleNodeStatusEvent(name, event);
     }
   }
 
@@ -258,13 +345,46 @@ export class ZwaveClient extends EventEmitter {
     this.emit(ZWAVE_CLIENT_EVENTS.VALUE_UPDATED, value);
   }
 
-  _handleNodeUpdated(node, eventName) {
-    this.nodes.set(node.id, node);
-    this.emit(eventName, node);
+  _handleValueRemoved(event) {
+    const node = this.nodes.get(event.nodeId);
+    if (!node?.values) return;
+    const valueId = event.args ?? {};
+    const index = node.values.findIndex(
+      (v) =>
+        v.commandClass === valueId.commandClass &&
+        v.endpoint === valueId.endpoint &&
+        v.property === valueId.property &&
+        v.propertyKey === valueId.propertyKey,
+    );
+    if (index >= 0) {
+      node.values.splice(index, 1);
+    }
   }
 
-  _handleNodeRemoved(node) {
-    this.nodes.delete(node.id);
-    this.emit(ZWAVE_CLIENT_EVENTS.NODE_REMOVED, node);
+  _handleNodeStatusEvent(name, event) {
+    const node = this.nodes.get(event.nodeId);
+    if (!node) return;
+    if (name in NODE_STATUS_EVENT_MAP) {
+      node.status = NODE_STATUS_EVENT_MAP[name];
+    }
+    if (name === 'ready') {
+      node.ready = true;
+    }
+    this.emit(ZWAVE_CLIENT_EVENTS.NODE_UPDATED, node);
+  }
+
+  _handleControllerEvent(event) {
+    const name = event.event;
+    if (name === 'node added' && event.node) {
+      const node = normalizeNode(event.node);
+      this.nodes.set(node.id, node);
+      this.emit(ZWAVE_CLIENT_EVENTS.NODE_ADDED, node);
+      return;
+    }
+    if (name === 'node removed' && event.node) {
+      const nodeId = event.node.nodeId ?? event.node.id;
+      this.nodes.delete(nodeId);
+      this.emit(ZWAVE_CLIENT_EVENTS.NODE_REMOVED, { id: nodeId });
+    }
   }
 }

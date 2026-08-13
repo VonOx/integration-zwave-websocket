@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------------
 // Manifest actions (buttons in the Configuration screen):
-//   - test_connection: connect to zwave-js-ui, report the node count.
+//   - test_connection: connect to zwave-js-server, report the node count.
 //   - identify: opportunistic — only works on nodes exposing Indicator CC's
 //     "identify" value; a harmless message otherwise.
 // -----------------------------------------------------------------------------
@@ -17,9 +17,6 @@ export async function testConnection(config, { ZwaveClientClass = ZwaveClient } 
     host: config.host,
     port: config.port,
     ssl: config.ssl,
-    useAuth: config.auth_required,
-    username: config.username,
-    password: config.password,
   });
 
   try {
