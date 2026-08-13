@@ -1,90 +1,106 @@
 // -----------------------------------------------------------------------------
-// Device registry.
-//
-// Add or remove device types here. Each device lives in its own file and
-// exposes the same shape:
-//   - key                        : short identifier (used in logs)
-//   - deviceExternalId(gladys)   : the device external_id (for dispatch)
-//   - buildDevice(gladys, config): the discovery payload sent to Gladys
-//   - onPoll(gladys, config)      (optional): periodic read
-//   - onSetValue(gladys, {...})   (optional): run a user command
-//   - onGetImage(gladys, {...})   (optional): fresh camera capture, resolved
-//     as an `image/jpg;base64,...` string (cameras only)
-//   - startPush(gladys, config)   (optional): subscribe to a real-time stream
-//   - transport(gladys, config)   (optional): effective transport of the
-//     device, shown as a badge in Gladys. Either a plain string ('local' |
-//     'cloud' | 'unreachable') or an object `{ transport, degraded, message }`
-//     to also flag the "works, but not nominal" state (orange dot + tooltip)
-//   - identify(gladys, {...})     (optional): make the physical device signal
-//     itself (blink...), used by the `identify` manifest action
-//   - actions                     (optional): manifest action handlers, keyed
-//     by the action `key` declared in gladys-assistant-integration.json
+// Dynamic device registry: rebuilds Gladys devices/features from the live
+// zwave-js-ui snapshot (no static blueprint list). Keeps two indices so that
+// resolving a write (feature external_id -> node/value) or a live push
+// (node/value -> feature external_id) is a plain `Map.get`, never string
+// parsing on the hot path.
 // -----------------------------------------------------------------------------
 
-import { weatherStation } from './weatherStation.js';
-import { switchDevice } from './switchDevice.js';
-import { light } from './light.js';
-import { plug } from './plug.js';
-import { motionSensor } from './motionSensor.js';
-import { camera } from './camera.js';
+import { createLogger } from '@gladysassistant/integration-sdk';
+import { buildDeviceFromNode, nodeDeviceExternalId } from './nodeDevice.js';
+import { valueKey } from './ccMapping.js';
 
-export const DEVICE_BLUEPRINTS = [weatherStation, switchDevice, light, plug, motionSensor, camera];
+const logger = createLogger({ name: 'zwave-devices' });
 
-/**
- * Build the discovery payload for Gladys (all devices).
- */
-export function buildDiscoveredDevices(gladys, config) {
-  return DEVICE_BLUEPRINTS.map((bp) => bp.buildDevice(gladys, config));
-}
+export function createNodeRegistry(gladys) {
+  let featureIndex = new Map(); // feature external_id -> { nodeId, mapping }
+  let valueIndex = new Map(); // "nodeId:mapping.key" -> feature external_id
+  let deviceIndex = new Map(); // device external_id -> nodeId
 
-/**
- * Find the blueprint that owns a given device, from its external_id
- * (used to route onPoll / onSetValue / onGetImage to the right device).
- */
-export function findBlueprintByDevice(gladys, device) {
-  return DEVICE_BLUEPRINTS.find((bp) => bp.deviceExternalId(gladys) === device.external_id);
-}
+  function rebuild(zwaveClient) {
+    featureIndex = new Map();
+    valueIndex = new Map();
+    deviceIndex = new Map();
 
-/**
- * Build the `publishTransports` payload: one entry per blueprint that reports
- * its effective transport (dual-channel devices). Devices with a single,
- * obvious channel simply do not implement `transport()`.
- *
- * A blueprint returns either a plain transport string, or an object
- * `{ transport, degraded, message }` when it needs to flag a degraded state
- * (SDK v0.7+): "it works, but not in the nominal mode" — e.g. local preferred
- * but refused, falling back to cloud. Entries WITHOUT `degraded` clear a
- * previously published degraded state, so nominal blueprints have nothing
- * special to do.
- */
-export function buildTransportEntries(gladys, config) {
-  return DEVICE_BLUEPRINTS.filter((bp) => typeof bp.transport === 'function').map((bp) => {
-    const reported = bp.transport(gladys, config);
-    const entry = typeof reported === 'string' ? { transport: reported } : reported;
-    return { external_id: bp.deviceExternalId(gladys), ...entry };
-  });
-}
+    const devices = [];
+    for (const node of zwaveClient.getSnapshot().values()) {
+      const { device, entries } = buildDeviceFromNode(gladys, node);
+      if (entries.length === 0) {
+        logger.debug(`Skipping node ${node.id}: no mapped features`);
+        continue;
+      }
 
-/**
- * Handler of the `identify` manifest action: make the chosen device signal
- * itself so the user can spot it among identical hardware.
- *
- * `externalId` comes from the action's dynamic select (`"source": "devices"`
- * in the manifest): the Configuration screen populates the options with the
- * integration's OWN created devices (label = device name, value =
- * external_id), so the user never copies an identifier by hand.
- */
-export async function identifyDevice(gladys, externalId, config) {
-  const blueprint = findBlueprintByDevice(gladys, { external_id: externalId });
-  if (!blueprint || typeof blueprint.identify !== 'function') {
-    return {
-      en: 'This device has no way to signal itself.',
-      fr: 'Cet appareil ne peut pas se signaler.',
-    };
+      deviceIndex.set(device.external_id, node.id);
+      for (const { mapping, externalId } of entries) {
+        featureIndex.set(externalId, { nodeId: node.id, mapping });
+        valueIndex.set(`${node.id}:${mapping.key}`, externalId);
+      }
+      devices.push(device);
+    }
+    return devices;
   }
-  await blueprint.identify(gladys, { config });
+
+  function buildCurrentStates(zwaveClient) {
+    const states = [];
+    for (const [featureExternalId, { nodeId, mapping }] of featureIndex) {
+      const node = zwaveClient.getSnapshot().get(nodeId);
+      const value = node?.values?.find((v) => valueKey(v) === mapping.key);
+      if (value === undefined || value.value === undefined || value.value === null) {
+        continue;
+      }
+      states.push({
+        device_feature_external_id: featureExternalId,
+        state: mapping.toGladys(value.value),
+      });
+    }
+    return states;
+  }
+
+  function resolveFeature(featureExternalId) {
+    return featureIndex.get(featureExternalId);
+  }
+
+  function resolveValueUpdate(value) {
+    const featureExternalId = valueIndex.get(`${value.nodeId}:${valueKey(value)}`);
+    if (!featureExternalId) {
+      return null;
+    }
+    return { featureExternalId, ...featureIndex.get(featureExternalId) };
+  }
+
+  function getDeviceExternalId(nodeId) {
+    return nodeDeviceExternalId(gladys, nodeId);
+  }
+
+  function getNodeIdForDevice(deviceExternalId) {
+    return deviceIndex.get(deviceExternalId);
+  }
+
+  function getKnownNodeIds() {
+    return [...deviceIndex.values()];
+  }
+
   return {
-    en: 'Look around: the device is signalling itself.',
-    fr: "Regardez autour de vous : l'appareil se signale.",
+    rebuild,
+    buildCurrentStates,
+    resolveFeature,
+    resolveValueUpdate,
+    getDeviceExternalId,
+    getNodeIdForDevice,
+    getKnownNodeIds,
   };
+}
+
+/** zwave-js-ui reports node liveness via `status`/`available`/`ready` — accept any of them. */
+export function isNodeUnreachable(node) {
+  if (!node) {
+    return true;
+  }
+  if (typeof node.available === 'boolean' && !node.available) {
+    return true;
+  }
+  if (typeof node.status === 'string' && /dead/i.test(node.status)) {
+    return true;
+  }
+  return false;
 }

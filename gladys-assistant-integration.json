@@ -1,87 +1,102 @@
 {
   "manifest_version": 1,
   "type": "device",
-  "name": "Demo Devices Template",
+  "name": "Z-Wave (zwave-js-ui)",
   "description": {
-    "en": "Starter template showing sensors, a switch, a dimmable light and a smart plug.",
-    "fr": "Template de démarrage : capteurs, interrupteur, lampe variable et prise connectée."
+    "en": "Control your Z-Wave network through zwave-js-ui's native Socket.IO API.",
+    "fr": "Pilotez votre réseau Z-Wave via l'API Socket.IO native de zwave-js-ui."
   },
   "version": "1.0.0",
   "docker_image": "ghcr.io/gladysassistant/integration-template-js:1.0.0",
   "gladys_version": ">=4.85.0",
   "cover_image": "https://raw.githubusercontent.com/GladysAssistant/integration-template-js/master/cover.png",
-  "transports": ["local", "cloud"],
+  "transports": ["local"],
   "config_schema": [
     {
       "key": "intro",
       "type": "section",
       "label": { "en": "Getting started", "fr": "Pour commencer" },
       "description": {
-        "en": "The demo weather station reads real data from the free Open-Meteo API: pick the coordinates to observe. No account, no API key.",
-        "fr": "La station météo de démonstration lit de vraies données via l'API gratuite Open-Meteo : choisissez les coordonnées à observer. Pas de compte, pas de clé d'API."
+        "en": "Connects to your zwave-js-ui instance over its native Socket.IO API, the same one its own web dashboard uses. Use the WEB UI port (8091 by default) — NOT the zwave-js-server port (3000).",
+        "fr": "Se connecte à votre instance zwave-js-ui via son API Socket.IO native, la même que celle utilisée par son propre tableau de bord web. Utilisez le port de l'INTERFACE WEB (8091 par défaut) — PAS le port de zwave-js-server (3000)."
       },
       "links": [
         {
-          "url": "https://open-meteo.com/en/docs",
-          "label": { "en": "Open-Meteo documentation", "fr": "Documentation Open-Meteo" }
+          "url": "https://zwave-js.github.io/zwave-js-ui/#/",
+          "label": { "en": "zwave-js-ui documentation", "fr": "Documentation zwave-js-ui" }
         }
       ]
     },
     {
-      "key": "latitude",
-      "type": "number",
-      "label": { "en": "Latitude", "fr": "Latitude" },
+      "key": "host",
+      "type": "string",
+      "label": { "en": "Host", "fr": "Hôte" },
       "description": {
-        "en": "Latitude used for the demo weather sensor.",
-        "fr": "Latitude utilisée par le capteur météo de démonstration."
+        "en": "IP address or hostname of the zwave-js-ui instance.",
+        "fr": "Adresse IP ou nom d'hôte de l'instance zwave-js-ui."
+      },
+      "required": true
+    },
+    {
+      "key": "port",
+      "type": "number",
+      "label": { "en": "Port", "fr": "Port" },
+      "description": {
+        "en": "zwave-js-ui web UI port (default 8091).",
+        "fr": "Port de l'interface web zwave-js-ui (8091 par défaut)."
       },
       "required": true,
-      "default": 48.8566,
-      "min": -90,
-      "max": 90
+      "default": 8091,
+      "min": 1,
+      "max": 65535
     },
     {
-      "key": "longitude",
-      "type": "number",
-      "label": { "en": "Longitude", "fr": "Longitude" },
+      "key": "ssl",
+      "type": "boolean",
+      "label": { "en": "Use HTTPS/WSS", "fr": "Utiliser HTTPS/WSS" },
       "description": {
-        "en": "Longitude used for the demo weather sensor.",
-        "fr": "Longitude utilisée par le capteur météo de démonstration."
-      },
-      "required": true,
-      "default": 2.3522,
-      "min": -180,
-      "max": 180
-    },
-    {
-      "key": "unit",
-      "type": "select",
-      "label": { "en": "Temperature unit", "fr": "Unité de température" },
-      "required": false,
-      "default": "celsius",
-      "options": [
-        { "value": "celsius", "label": { "en": "Celsius", "fr": "Celsius" } },
-        { "value": "fahrenheit", "label": { "en": "Fahrenheit", "fr": "Fahrenheit" } }
-      ]
-    },
-    {
-      "key": "poll_frequency",
-      "type": "number",
-      "label": { "en": "Refresh interval (s)", "fr": "Intervalle de rafraîchissement (s)" },
-      "description": {
-        "en": "How often sensors are polled, in seconds.",
-        "fr": "Fréquence d'interrogation des capteurs, en secondes."
+        "en": "Enable if zwave-js-ui is served behind TLS (e.g. a reverse proxy).",
+        "fr": "À activer si zwave-js-ui est servi derrière TLS (ex. reverse proxy)."
       },
       "required": false,
-      "default": 300,
-      "min": 30,
-      "max": 3600
+      "default": false
+    },
+    {
+      "key": "auth_required",
+      "type": "boolean",
+      "label": { "en": "Authentication required", "fr": "Authentification requise" },
+      "description": {
+        "en": "Enable if your zwave-js-ui instance has login enabled (must match its own \"Auth enabled\" setting).",
+        "fr": "À activer si votre instance zwave-js-ui a la connexion activée (doit correspondre à son propre réglage « Auth enabled »)."
+      },
+      "required": false,
+      "default": false
+    },
+    {
+      "key": "username",
+      "type": "string",
+      "label": { "en": "Username", "fr": "Nom d'utilisateur" },
+      "description": {
+        "en": "Only used when authentication is required.",
+        "fr": "Utilisé uniquement si l'authentification est requise."
+      },
+      "required": false
+    },
+    {
+      "key": "password",
+      "type": "secret",
+      "label": { "en": "Password", "fr": "Mot de passe" },
+      "description": {
+        "en": "Only used when authentication is required.",
+        "fr": "Utilisé uniquement si l'authentification est requise."
+      },
+      "required": false
     }
   ],
   "actions": [
     {
-      "key": "test_weather",
-      "label": { "en": "Test the weather provider", "fr": "Tester le fournisseur météo" },
+      "key": "test_connection",
+      "label": { "en": "Test the connection", "fr": "Tester la connexion" },
       "timeout_seconds": 30
     },
     {

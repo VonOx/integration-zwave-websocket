@@ -1,12 +1,10 @@
 // -----------------------------------------------------------------------------
 // Entry point of the Gladys external integration.
 //
-// Role of this file: wire the SDK to the device catalog (src/devices/). It holds
-// NO hardware logic: all the control "work" lives in the device modules. This
-// file only:
-//   1. instantiates the SDK (connection, auth, reconnection: handled for you);
-//   2. registers the event handlers BEFORE connect();
-//   3. connects and publishes the discovered devices.
+// Connects to zwave-js-ui's native Socket.IO API (port 8091 by default) and
+// mirrors its live node/value snapshot into Gladys devices/features. All the
+// Z-Wave protocol logic lives in src/zwaveClient.js and src/devices/; this
+// file only wires the SDK lifecycle to that snapshot.
 //
 // Environment variables provided by the Gladys supervisor to the container:
 //   - GLADYS_HOST_API_URL         (host API URL)
@@ -15,123 +13,247 @@
 // The SDK reads them automatically: `new GladysIntegration()` is enough.
 // -----------------------------------------------------------------------------
 
-import { GladysIntegration, logger } from '@gladysassistant/integration-sdk';
-import { normalizeConfig } from './src/config.js';
-import {
-  DEVICE_BLUEPRINTS,
-  buildDiscoveredDevices,
-  buildTransportEntries,
-  findBlueprintByDevice,
-  identifyDevice,
-} from './src/devices/index.js';
+import { GladysIntegration, logger, DEVICE_TRANSPORTS } from '@gladysassistant/integration-sdk';
+import { normalizeConfig, isConfigComplete } from './src/config.js';
+import { ZwaveClient, ZWAVE_CLIENT_EVENTS } from './src/zwaveClient.js';
+import { createNodeRegistry, isNodeUnreachable } from './src/devices/index.js';
+import { testConnection, identifyDevice } from './src/actions.js';
 
 const gladys = new GladysIntegration();
 
 // Current configuration (hot-reloaded via onConfigUpdated).
 let config = normalizeConfig();
 
-// Cleanup functions for the "push" subscriptions (e.g. the motion sensor).
-let pushCleanups = [];
+// Rebuilt on every discovery pass; resolves feature <-> node/value lookups.
+const registry = createNodeRegistry(gladys);
+
+// The live socket connection to zwave-js-ui. Null while disconnected/unconfigured.
+let zwaveClient = null;
+
+async function publishDiscovery() {
+  const devices = registry.rebuild(zwaveClient);
+  await gladys.publishDiscoveredDevices(devices);
+}
+
+async function publishInitialStates() {
+  const states = registry.buildCurrentStates(zwaveClient);
+  for (let i = 0; i < states.length; i += 100) {
+    await gladys.publishStates(states.slice(i, i + 100));
+  }
+}
+
+// Reused for offline/dead nodes, repurposing the same transport-badge
+// mechanism a dual-channel device would use for its cloud fallback.
+async function publishUnreachableBadges() {
+  const entries = [];
+  for (const node of zwaveClient.getSnapshot().values()) {
+    if (isNodeUnreachable(node)) {
+      entries.push({
+        external_id: registry.getDeviceExternalId(node.id),
+        transport: DEVICE_TRANSPORTS.UNREACHABLE,
+      });
+    }
+  }
+  if (entries.length > 0) {
+    await gladys.publishTransports(entries);
+  }
+}
+
+function wireZwaveClient(client) {
+  client.on(ZWAVE_CLIENT_EVENTS.READY, async () => {
+    try {
+      await publishDiscovery();
+      await publishInitialStates();
+      await publishUnreachableBadges();
+      await gladys.setConnectionStatus(true);
+    } catch (err) {
+      logger.error('Post-connection initialization failed', err);
+      await gladys
+        .setConnectionStatus(false, {
+          en: 'Initialization failed, check the integration logs.',
+          fr: "L'initialisation a échoué, consultez les logs de l'intégration.",
+        })
+        .catch(() => {});
+    }
+  });
+
+  client.on(ZWAVE_CLIENT_EVENTS.VALUE_UPDATED, async (value) => {
+    const resolved = registry.resolveValueUpdate(value);
+    if (!resolved) {
+      return;
+    }
+    try {
+      await gladys.publishState(resolved.featureExternalId, resolved.mapping.toGladys(value.value));
+    } catch (err) {
+      logger.error('publishState failed', err);
+    }
+  });
+
+  client.on(ZWAVE_CLIENT_EVENTS.NODE_ADDED, async () => {
+    try {
+      await publishDiscovery();
+    } catch (err) {
+      logger.error('Discovery refresh failed', err);
+    }
+  });
+
+  client.on(ZWAVE_CLIENT_EVENTS.NODE_UPDATED, async (node) => {
+    try {
+      await publishUnreachableBadges();
+      if (!isNodeUnreachable(node)) {
+        // Coming back online (or reporting new info) may expose new features.
+        await publishDiscovery();
+      }
+    } catch (err) {
+      logger.error('Node update handling failed', err);
+    }
+  });
+
+  client.on(ZWAVE_CLIENT_EVENTS.NODE_REMOVED, async (node) => {
+    // Never delete the device: only flag it unreachable, same constraint as
+    // any dual-channel device that loses both its transports.
+    try {
+      await gladys.publishTransports([
+        {
+          external_id: registry.getDeviceExternalId(node.id),
+          transport: DEVICE_TRANSPORTS.UNREACHABLE,
+        },
+      ]);
+    } catch (err) {
+      logger.error('Transport publish failed', err);
+    }
+  });
+
+  client.on(ZWAVE_CLIENT_EVENTS.DISCONNECTED, () => {
+    logger.warn('Disconnected from zwave-js-ui');
+    gladys
+      .setConnectionStatus(false, {
+        en: 'Disconnected from zwave-js-ui.',
+        fr: 'Déconnecté de zwave-js-ui.',
+      })
+      .catch(() => {});
+  });
+
+  client.on(ZWAVE_CLIENT_EVENTS.ERROR, (err) => {
+    logger.error('zwave-js-ui client error', err);
+  });
+}
+
+function disconnectZwave() {
+  if (zwaveClient) {
+    zwaveClient.disconnect();
+    zwaveClient = null;
+  }
+}
+
+async function connectZwave() {
+  disconnectZwave();
+
+  if (!isConfigComplete(config)) {
+    logger.warn('Configuration incomplete, waiting for host/credentials.');
+    await gladys
+      .setConnectionStatus(false, {
+        en: 'Configure the zwave-js-ui host first.',
+        fr: "Configurez d'abord l'hôte zwave-js-ui.",
+      })
+      .catch(() => {});
+    return;
+  }
+
+  zwaveClient = new ZwaveClient({
+    host: config.host,
+    port: config.port,
+    ssl: config.ssl,
+    useAuth: config.auth_required,
+    username: config.username,
+    password: config.password,
+  });
+  wireZwaveClient(zwaveClient);
+
+  try {
+    await zwaveClient.connect();
+  } catch (err) {
+    logger.error('Connection to zwave-js-ui failed', err);
+    await gladys
+      .setConnectionStatus(false, {
+        en: 'Could not connect to zwave-js-ui, check host/credentials.',
+        fr: "Connexion à zwave-js-ui impossible, vérifiez l'hôte et les identifiants.",
+      })
+      .catch(() => {});
+  }
+}
 
 // --- Discovery: Gladys asks for the list of devices --------------------------
 gladys.onScanRequest(async () => {
   logger.info('onScanRequest -> publishing discovered devices');
-  await gladys.publishDiscoveredDevices(buildDiscoveredDevices(gladys, config));
+  await gladys.publishDiscoveredDevices(zwaveClient ? registry.rebuild(zwaveClient) : []);
 });
 
 // --- Command: the user acts on a controllable feature ------------------------
 gladys.onSetValue(async (device, feature, value) => {
   logger.info(`onSetValue <- ${feature.external_id} = ${value}`);
-  const blueprint = findBlueprintByDevice(gladys, device);
-  if (!blueprint || typeof blueprint.onSetValue !== 'function') {
-    // Throw: the SDK sends a success:false acknowledgement to Gladys.
-    throw new Error(`No command handler for ${device.external_id}`);
+  if (!zwaveClient) {
+    throw new Error('Not connected to zwave-js-ui');
   }
-  await blueprint.onSetValue(gladys, { device, feature, value, config });
-});
-
-// --- Camera: Gladys needs a FRESH image of a camera device -------------------
-// Triggered by the dashboard live view or a chat intent. The resolved
-// `image/jpg;base64,...` string (≤ 150 KB) is acked back to Gladys; the ack is
-// awaited under 15 s (not the usual 5 s), so a real capture fits.
-gladys.onGetImage(async (device) => {
-  logger.info(`onGetImage <- ${device.external_id}`);
-  const blueprint = findBlueprintByDevice(gladys, device);
-  if (!blueprint || typeof blueprint.onGetImage !== 'function') {
-    throw new Error(`No camera handler for ${device.external_id}`);
+  const resolved = registry.resolveFeature(feature.external_id);
+  if (!resolved || resolved.mapping.read_only || !resolved.mapping.writeValueId) {
+    throw new Error(`No command handler for ${feature.external_id}`);
   }
-  return blueprint.onGetImage(gladys, { device, config });
+  const rawValue = resolved.mapping.toZwave(value);
+  await zwaveClient.writeValue(
+    { nodeId: resolved.nodeId, ...resolved.mapping.writeValueId },
+    rawValue,
+  );
 });
 
 // --- Polling: Gladys asks to refresh a device --------------------------------
+// Z-Wave here is push-driven over the socket; this only re-publishes the
+// current cached snapshot for that device, it never queries zwave-js-ui.
 gladys.onPoll(async (device) => {
-  const blueprint = findBlueprintByDevice(gladys, device);
-  if (!blueprint || typeof blueprint.onPoll !== 'function') {
-    logger.debug(`onPoll ignored (no polling) for ${device.external_id}`);
+  if (!zwaveClient) {
     return;
   }
-  await blueprint.onPoll(gladys, config);
+  const nodeId = registry.getNodeIdForDevice(device.external_id);
+  if (nodeId === undefined) {
+    return;
+  }
+  const states = registry
+    .buildCurrentStates(zwaveClient)
+    .filter(
+      (state) => registry.resolveFeature(state.device_feature_external_id)?.nodeId === nodeId,
+    );
+  if (states.length > 0) {
+    await gladys.publishStates(states);
+  }
 });
 
 // --- Manifest actions: buttons in the Configuration screen -------------------
-// Each action declared in the `actions` field of the manifest is registered
-// per key; the message resolved by the handler is displayed under the button
-// (the ack is awaited under the action's `timeout_seconds`, not the usual 5 s).
-for (const blueprint of DEVICE_BLUEPRINTS) {
-  for (const [actionKey, handler] of Object.entries(blueprint.actions ?? {})) {
-    gladys.onAction(actionKey, (fields) => handler(gladys, { fields, config }));
-  }
-}
+gladys.onAction('test_connection', () => testConnection(config));
 
-// The `identify` action targets ONE device chosen by the user, so it is not
-// owned by a single blueprint. Its manifest field declares
-// `"source": "devices"` (SDK v0.7+): instead of static `options`, the
-// Configuration screen fills the select with the integration's own created
-// devices, and the handler receives the chosen external_id as a field value.
+// The `identify` action targets ONE device chosen by the user; its manifest
+// field declares `"source": "devices"` (SDK v0.7+), so the Configuration
+// screen fills the select with the integration's own created devices.
 gladys.onAction('identify', (fields) => {
   logger.info(`Action identify <- ${fields.device}`);
-  return identifyDevice(gladys, fields.device, config);
+  if (!zwaveClient) {
+    return { en: 'Not connected to zwave-js-ui.', fr: 'Non connecté à zwave-js-ui.' };
+  }
+  return identifyDevice(zwaveClient, fields.device);
 });
 
 // --- Configuration updated by the user ---------------------------------------
 gladys.onConfigUpdated(async (newConfig) => {
   logger.info('onConfigUpdated -> new configuration received');
   config = normalizeConfig(newConfig);
-  // Re-publish the devices: some properties (unit, frequency) depend on it.
-  // publishDiscoveredDevices is idempotent (upsert by external_id).
-  await gladys.publishDiscoveredDevices(buildDiscoveredDevices(gladys, config));
-  // The reserved GLADYS_PREFER_LOCAL key arrives here like any other key:
-  // re-route the dual-channel devices, then reflect the ACTUAL outcome.
-  await publishDeviceTransports();
+  // Host/port/credentials may have changed: reconnect from scratch.
+  await connectZwave();
 });
 
 // --- Connection lifecycle ----------------------------------------------------
-// The SDK itself logs the WebSocket lifecycle (connections, disconnections,
-// reconnection attempts) under the `gladys-sdk` name: no need to log it again
-// here, these handlers only run the integration's own (re)initialization.
 gladys.on('connected', async () => {
   try {
-    // 1) Fetch the config filled in by the user.
     config = normalizeConfig(await gladys.getConfig());
-
-    // 2) (Re)publish all devices as soon as we are connected.
-    await gladys.publishDiscoveredDevices(buildDiscoveredDevices(gladys, config));
-
-    // 3) Publish the per-device transport badge (cloud/local, dual-channel
-    // devices only). Lightweight channel: on a live switch, call it again
-    // without re-publishing the devices.
-    await publishDeviceTransports();
-
-    // 4) Start the real-time subscriptions ("push" sensors, camera snapshots).
-    stopPushSubscriptions();
-    pushCleanups = DEVICE_BLUEPRINTS.filter((bp) => typeof bp.startPush === 'function').map((bp) =>
-      bp.startPush(gladys, config),
-    );
-
-    // 5) Report the application-level status, shown in the Configuration
-    // screen. Distinct from the container state machine: an integration can
-    // be RUNNING and still disconnected from its third-party service.
-    await gladys.setConnectionStatus(true);
+    await connectZwave();
   } catch (err) {
     logger.error('Post-connection initialization failed', err);
     await gladys
@@ -144,42 +266,17 @@ gladys.on('connected', async () => {
 });
 
 gladys.on('disconnected', () => {
-  stopPushSubscriptions();
+  disconnectZwave();
 });
 
-// Publish the effective transport of every dual-channel device
-// ('local' | 'cloud' | 'unreachable'), rendered as a badge in the Gladys UI.
-// An entry can also flag a degraded state (`{ degraded: true, message }`,
-// SDK v0.7+): the badge keeps its transport color plus an orange dot, and the
-// tooltip shows the reason — see src/devices/plug.js.
-async function publishDeviceTransports() {
-  const entries = buildTransportEntries(gladys, config);
-  if (entries.length > 0) {
-    await gladys.publishTransports(entries);
-  }
-}
-
-function stopPushSubscriptions() {
-  for (const cleanup of pushCleanups) {
-    try {
-      cleanup?.();
-    } catch (err) {
-      logger.error('Push subscription cleanup failed', err);
-    }
-  }
-  pushCleanups = [];
-}
-
 // --- Graceful shutdown -------------------------------------------------------
-// The SDK stops the push subscriptions, disconnects cleanly and exits with
-// code 0 when the supervisor stops the container (SIGTERM/SIGINT).
 gladys.handleShutdown((signal) => {
   logger.info(`Received ${signal} -> graceful shutdown`);
-  stopPushSubscriptions();
+  disconnectZwave();
 });
 
 // --- Startup -----------------------------------------------------------------
-logger.info('Starting the template integration...');
+logger.info('Starting the Z-Wave (zwave-js-ui) integration...');
 gladys.connect().catch((err) => {
   logger.error('Initial connection failed', err);
   process.exit(1);

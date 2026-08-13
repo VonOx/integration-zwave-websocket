@@ -13,15 +13,12 @@
 // Defaults: they MUST stay consistent with the `default` values declared in the
 // `config_schema` of the manifest.
 export const DEFAULT_CONFIG = {
-  latitude: 48.8566, // Paris
-  longitude: 2.3522,
-  unit: 'celsius', // 'celsius' | 'fahrenheit'
-  poll_frequency: 300, // seconds, how often sensors are refreshed
-  // Reserved key (NOT in config_schema): because the manifest declares both
-  // 'local' and 'cloud' in its `transports` field, Gladys shows a standard
-  // "Prefer the local connection" toggle and sends the user's choice here.
-  // Read-only for the integration; defaults to true.
-  GLADYS_PREFER_LOCAL: true,
+  host: '',
+  port: 8091,
+  ssl: false,
+  auth_required: false,
+  username: '',
+  password: '',
 };
 
 /**
@@ -32,11 +29,26 @@ export function normalizeConfig(raw = {}) {
   return {
     ...DEFAULT_CONFIG,
     ...raw,
-    // Force the types: config may arrive as strings from a form.
-    latitude: Number(raw.latitude ?? DEFAULT_CONFIG.latitude),
-    longitude: Number(raw.longitude ?? DEFAULT_CONFIG.longitude),
-    poll_frequency: Number(raw.poll_frequency ?? DEFAULT_CONFIG.poll_frequency),
-    // The preference is a boolean; anything but an explicit false means true.
-    GLADYS_PREFER_LOCAL: raw.GLADYS_PREFER_LOCAL !== false,
+    host: String(raw.host ?? DEFAULT_CONFIG.host).trim(),
+    port: Number(raw.port ?? DEFAULT_CONFIG.port),
+    ssl: raw.ssl === true || raw.ssl === 'true',
+    auth_required: raw.auth_required === true || raw.auth_required === 'true',
+    username: String(raw.username ?? DEFAULT_CONFIG.username),
+    password: String(raw.password ?? DEFAULT_CONFIG.password),
   };
+}
+
+/**
+ * True once there is enough information to attempt a connection: a host/port
+ * are set, and credentials are present whenever authentication is required.
+ * @param {ReturnType<typeof normalizeConfig>} config
+ */
+export function isConfigComplete(config) {
+  if (!config.host || !config.port) {
+    return false;
+  }
+  if (config.auth_required && (!config.username || !config.password)) {
+    return false;
+  }
+  return true;
 }
