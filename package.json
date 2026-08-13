@@ -1,8 +1,8 @@
 {
-  "name": "gladys-integration-template-js",
+  "name": "integration-zwave-websocket",
   "version": "1.0.0",
   "private": true,
-  "description": "Official starter template to build an external integration for Gladys Assistant with the JavaScript SDK.",
+  "description": "Gladys Assistant external integration for Z-Wave devices via zwave-js-ui, connected over its native Socket.IO API.",
   "type": "module",
   "main": "index.js",
   "scripts": {
