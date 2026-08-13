@@ -108,6 +108,35 @@ test('writeValue rejects when zwave-js-ui reports failure', async () => {
   await assert.rejects(() => client.writeValue({ nodeId: 1 }, true), /node unresponsive/);
 });
 
+test('connect() rejects when the INITED handshake fails instead of hanging forever', async () => {
+  const { ioFactory, getSocket } = createFakeIoFactory({ nodes: [] });
+  const client = new ZwaveClient({ host: 'zwave.local', port: 8091, ioFactory });
+
+  const connectPromise = client.connect();
+  getSocket().ackHandlers.INITED = async () => {
+    throw new Error('operation has timed out');
+  };
+
+  await assert.rejects(connectPromise, /operation has timed out/);
+});
+
+test('a handshake failure never crashes the process even without an external error listener', async () => {
+  const { ioFactory, getSocket } = createFakeIoFactory({ nodes: [] });
+  const client = new ZwaveClient({ host: 'zwave.local', port: 8091, ioFactory });
+
+  const connectPromise = client.connect();
+  getSocket().ackHandlers.INITED = async () => {
+    throw new Error('operation has timed out');
+  };
+  await assert.rejects(connectPromise);
+
+  // A second, later handshake failure (e.g. a reconnect attempt) on the same
+  // client must still not throw, even though nothing external is listening.
+  assert.doesNotThrow(() => {
+    client.emit(ZWAVE_CLIENT_EVENTS.ERROR, new Error('operation has timed out'));
+  });
+});
+
 test('disconnect tears down the socket and clears the snapshot', async () => {
   const { ioFactory, getSocket } = createFakeIoFactory({ nodes: [{ id: 1, values: [] }] });
   const client = new ZwaveClient({ host: 'zwave.local', port: 8091, ioFactory });

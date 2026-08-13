@@ -54,6 +54,13 @@ export class ZwaveClient extends EventEmitter {
 
     this.socket = null;
     this._token = null; // in-memory only: never written to disk (read-only rootfs)
+
+    // Node throws (crashing the process) if an 'error' event has zero
+    // listeners at emit time. This class uses 'error' as an application-level
+    // event (see _onConnect/_attachListeners), so guarantee at least one
+    // listener always exists regardless of what the consumer wires up;
+    // logging already happens before every emit, so this stays a safety net.
+    this.on(ZWAVE_CLIENT_EVENTS.ERROR, () => {});
   }
 
   get baseUrl() {
@@ -85,17 +92,31 @@ export class ZwaveClient extends EventEmitter {
         if (settled) return;
         settled = true;
         socket.off('connect_error', onConnectError);
+        this.off(ZWAVE_CLIENT_EVENTS.ERROR, onError);
         resolve();
       };
       const onConnectError = (err) => {
         if (settled) return;
         settled = true;
         this.off(ZWAVE_CLIENT_EVENTS.READY, onReady);
+        this.off(ZWAVE_CLIENT_EVENTS.ERROR, onError);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      };
+      // A handshake (INITED/SUBSCRIBE) failure only ever surfaces as an
+      // 'error' emit, never 'connect_error' (the transport did connect fine).
+      // Without this, connect() never settles on that failure and the caller
+      // awaits it forever.
+      const onError = (err) => {
+        if (settled) return;
+        settled = true;
+        this.off(ZWAVE_CLIENT_EVENTS.READY, onReady);
+        socket.off('connect_error', onConnectError);
         reject(err instanceof Error ? err : new Error(String(err)));
       };
 
       this.once(ZWAVE_CLIENT_EVENTS.READY, onReady);
       socket.once('connect_error', onConnectError);
+      this.once(ZWAVE_CLIENT_EVENTS.ERROR, onError);
 
       this._attachListeners(socket);
     });
