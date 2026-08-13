@@ -6,11 +6,13 @@
     "en": "Control your Z-Wave network through zwave-js-server, the documented WebSocket gateway exposed by zwave-js-ui.",
     "fr": "Pilotez votre réseau Z-Wave via zwave-js-server, la passerelle WebSocket documentée exposée par zwave-js-ui."
   },
-  "version": "2.1.0",
-  "docker_image": "ghcr.io/vonox/integration-zwave-websocket:2.1.0",
+  "version": "2.2.0",
+  "docker_image": "ghcr.io/vonox/integration-zwave-websocket:2.2.0",
   "gladys_version": ">=4.85.0",
   "cover_image": "https://raw.githubusercontent.com/VonOx/integration-zwave-websocket/main/cover.png",
-  "transports": ["local"],
+  "transports": [
+    "local"
+  ],
   "config_schema": [
     {
       "key": "intro",
