@@ -6,16 +6,21 @@
     "en": "Control your Z-Wave network through zwave-js-ui's native Socket.IO API.",
     "fr": "Pilotez votre réseau Z-Wave via l'API Socket.IO native de zwave-js-ui."
   },
-  "version": "1.0.0",
-  "docker_image": "ghcr.io/gladysassistant/integration-template-js:1.0.0",
+  "version": "2.0.0",
+  "docker_image": "ghcr.io/vonox/integration-zwave-websocket:2.0.0",
   "gladys_version": ">=4.85.0",
   "cover_image": "https://raw.githubusercontent.com/VonOx/integration-zwave-websocket/main/cover.png",
-  "transports": ["local"],
+  "transports": [
+    "local"
+  ],
   "config_schema": [
     {
       "key": "intro",
       "type": "section",
-      "label": { "en": "Getting started", "fr": "Pour commencer" },
+      "label": {
+        "en": "Getting started",
+        "fr": "Pour commencer"
+      },
       "description": {
         "en": "Connects to your zwave-js-ui instance over its native Socket.IO API, the same one its own web dashboard uses. Use the WEB UI port (8091 by default) — NOT the zwave-js-server port (3000).",
         "fr": "Se connecte à votre instance zwave-js-ui via son API Socket.IO native, la même que celle utilisée par son propre tableau de bord web. Utilisez le port de l'INTERFACE WEB (8091 par défaut) — PAS le port de zwave-js-server (3000)."
@@ -23,14 +28,20 @@
       "links": [
         {
           "url": "https://zwave-js.github.io/zwave-js-ui/#/",
-          "label": { "en": "zwave-js-ui documentation", "fr": "Documentation zwave-js-ui" }
+          "label": {
+            "en": "zwave-js-ui documentation",
+            "fr": "Documentation zwave-js-ui"
+          }
         }
       ]
     },
     {
       "key": "host",
       "type": "string",
-      "label": { "en": "Host", "fr": "Hôte" },
+      "label": {
+        "en": "Host",
+        "fr": "Hôte"
+      },
       "description": {
         "en": "IP address or hostname of the zwave-js-ui instance.",
         "fr": "Adresse IP ou nom d'hôte de l'instance zwave-js-ui."
@@ -40,7 +51,10 @@
     {
       "key": "port",
       "type": "number",
-      "label": { "en": "Port", "fr": "Port" },
+      "label": {
+        "en": "Port",
+        "fr": "Port"
+      },
       "description": {
         "en": "zwave-js-ui web UI port (default 8091).",
         "fr": "Port de l'interface web zwave-js-ui (8091 par défaut)."
@@ -53,7 +67,10 @@
     {
       "key": "ssl",
       "type": "boolean",
-      "label": { "en": "Use HTTPS/WSS", "fr": "Utiliser HTTPS/WSS" },
+      "label": {
+        "en": "Use HTTPS/WSS",
+        "fr": "Utiliser HTTPS/WSS"
+      },
       "description": {
         "en": "Enable if zwave-js-ui is served behind TLS (e.g. a reverse proxy).",
         "fr": "À activer si zwave-js-ui est servi derrière TLS (ex. reverse proxy)."
@@ -64,7 +81,10 @@
     {
       "key": "auth_required",
       "type": "boolean",
-      "label": { "en": "Authentication required", "fr": "Authentification requise" },
+      "label": {
+        "en": "Authentication required",
+        "fr": "Authentification requise"
+      },
       "description": {
         "en": "Enable if your zwave-js-ui instance has login enabled (must match its own \"Auth enabled\" setting).",
         "fr": "À activer si votre instance zwave-js-ui a la connexion activée (doit correspondre à son propre réglage « Auth enabled »)."
@@ -75,7 +95,10 @@
     {
       "key": "username",
       "type": "string",
-      "label": { "en": "Username", "fr": "Nom d'utilisateur" },
+      "label": {
+        "en": "Username",
+        "fr": "Nom d'utilisateur"
+      },
       "description": {
         "en": "Only used when authentication is required.",
         "fr": "Utilisé uniquement si l'authentification est requise."
@@ -85,7 +108,10 @@
     {
       "key": "password",
       "type": "secret",
-      "label": { "en": "Password", "fr": "Mot de passe" },
+      "label": {
+        "en": "Password",
+        "fr": "Mot de passe"
+      },
       "description": {
         "en": "Only used when authentication is required.",
         "fr": "Utilisé uniquement si l'authentification est requise."
@@ -96,18 +122,27 @@
   "actions": [
     {
       "key": "test_connection",
-      "label": { "en": "Test the connection", "fr": "Tester la connexion" },
+      "label": {
+        "en": "Test the connection",
+        "fr": "Tester la connexion"
+      },
       "timeout_seconds": 30
     },
     {
       "key": "identify",
-      "label": { "en": "Identify a device", "fr": "Identifier un appareil" },
+      "label": {
+        "en": "Identify a device",
+        "fr": "Identifier un appareil"
+      },
       "fields": [
         {
           "key": "device",
           "type": "select",
           "source": "devices",
-          "label": { "en": "Device", "fr": "Appareil" },
+          "label": {
+            "en": "Device",
+            "fr": "Appareil"
+          },
           "required": true
         }
       ]

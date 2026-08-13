@@ -1,6 +1,6 @@
 {
   "name": "integration-zwave-websocket",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Gladys Assistant external integration for Z-Wave devices via zwave-js-ui, connected over its native Socket.IO API.",
   "type": "module",
